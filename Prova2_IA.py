@@ -32,6 +32,197 @@ df = pd.read_csv("sinais.csv")
 print("Dimensão da base:", df.shape)
 print("Colunas (amostra):", list(df.columns)[:10], "...")
 
+# Incluí este bloco para aproveitar os JSONs com keypoints frame a frame dos vídeos.
+# A ideia é transformar a sequência temporal (x,y,z, visibility de cada ponto por frame) em
+# um vetor fixo de "características de movimento" por vídeo. Isso deve melhorar a precisão,
+# pois meus modelos passam a ver dinâmica (velocidade, amplitude, variação no tempo) e não só
+# medidas estáticas do CSV. Também agrego tudo (médias, desvios, máximos) para manter o treino
+# rápido e compatível com o restante do pipeline tabular.
+
+import os, json
+from glob import glob
+
+USE_JSON_FEATURES = True           # Switch para ligar/desligar
+JSON_DIR = "json_frames"     
+JSON_SUFFIX = ".json"            
+
+def safe_mean(a):
+    a = np.asarray(a)
+    if a.size == 0: return np.nan
+    return float(np.nanmean(a))
+
+def safe_std(a):
+    a = np.asarray(a)
+    if a.size == 0: return np.nan
+    return float(np.nanstd(a))
+
+def pairwise_max_span(points_xy):
+    # Calculo a maior distância par-a-par entre keypoints em um frame.
+    # Interpreto isso como "abertura" corporal/mãos naquele instante.
+    # Para não ficar pesado, se houver muitos pontos eu amostro.
+    if points_xy.shape[0] < 2:
+        return 0.0
+    # Forma simples: amostra pares (para não ficar O(n^2) alto em muitos pontos)
+    idx = np.arange(points_xy.shape[0])
+    if points_xy.shape[0] > 40:
+        idx = np.random.RandomState(42).choice(idx, size=40, replace=False)
+    P = points_xy[idx]
+    # distância máxima
+    from scipy.spatial.distance import pdist
+    d = pdist(P, metric="euclidean")
+    return float(d.max()) if d.size else 0.0
+
+def extract_features_from_json(json_path):
+    """
+    Lê um JSON com estrutura:
+      {
+        "frames": [
+          {"frame": 0, "keypoints": [{"id":0,"x":...,"y":...,"z":...,"visibility":...}, ...]},
+          {"frame": 1, "keypoints": [... ]},
+          ...
+        ]
+      }
+    e devolve um dicionário de features agregadas no tempo.
+    """
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        return {"json_ok": 0}
+
+    frames = data.get("frames", [])
+    if not frames:
+        return {"json_ok": 0}
+
+    # Coletas por frame
+    centroids = []         # Centro (x,y) médio por frame
+    radii = []             # Raio médio (distância média ao centróide) por frame
+    spans = []             # Maior distância par-a-par por frame
+    vis_all = []           # Todas as visibilidades
+    xyz_all = []           # Todos os pontos (x,y,z) empilhados para stats globais
+
+    for fr in frames:
+        kps = fr.get("keypoints", [])
+        if not kps: 
+            continue
+        # Matriz [n_keypoints, 4] com (x,y,z,visibility)
+        arr = np.array([[kp.get("x", np.nan), kp.get("y", np.nan), kp.get("z", np.nan), kp.get("visibility", np.nan)]
+                         for kp in kps], dtype=float)
+        xy = arr[:, :2]
+        vis = arr[:, 3]
+        xyz_all.append(arr[:, :3])
+        vis_all.append(vis)
+
+        # Centróide e raio médio
+        c = np.nanmean(xy, axis=0)
+        centroids.append(c)
+        dists = np.sqrt(np.sum((xy - c)**2, axis=1))
+        radii.append(safe_mean(dists))
+
+        # Span máximo (aprox. abertura mãos/braços)
+        spans.append(pairwise_max_span(xy))
+
+    if not centroids:
+        return {"json_ok": 0}
+
+    centroids = np.vstack(centroids)  # shape (T,2)
+    radii = np.asarray(radii)         # (T,)
+    spans = np.asarray(spans)         # (T,)
+    vis_all = np.concatenate(vis_all) if len(vis_all) else np.array([])
+    xyz_all = np.vstack([x.reshape(-1, 3) for x in xyz_all]) if len(xyz_all) else np.empty((0,3))
+
+    # Velocidade do centróide (diferença entre frames)
+    if centroids.shape[0] >= 2:
+        vels = np.diff(centroids, axis=0)                 # (T-1,2)
+        speed = np.sqrt(np.sum(vels**2, axis=1))          # velocidade escalar
+    else:
+        speed = np.array([])
+
+    # "Energia" do movimento: soma do quadrado das velocidades (quanto mexeu ao longo do tempo)
+    motion_energy = float(np.nansum(speed**2)) if speed.size else 0.0
+
+    feats = {
+        "json_ok": 1,
+        "json_n_frames": centroids.shape[0],
+        "json_visibility_mean": safe_mean(vis_all),
+        "json_centroid_x_mean": safe_mean(centroids[:,0]),
+        "json_centroid_y_mean": safe_mean(centroids[:,1]),
+        "json_centroid_x_std":  safe_std(centroids[:,0]),
+        "json_centroid_y_std":  safe_std(centroids[:,1]),
+        "json_radius_mean": safe_mean(radii),
+        "json_radius_std":  safe_std(radii),
+        "json_span_mean": safe_mean(spans),
+        "json_span_max":  float(np.nanmax(spans)) if spans.size else 0.0,
+        "json_span_std":  safe_std(spans),
+        "json_speed_mean": safe_mean(speed),
+        "json_speed_max":  float(np.nanmax(speed)) if speed.size else 0.0,
+        "json_speed_std":  safe_std(speed),
+        "json_motion_energy": motion_energy,
+        "json_x_mean": safe_mean(xyz_all[:,0]) if xyz_all.size else np.nan,
+        "json_y_mean": safe_mean(xyz_all[:,1]) if xyz_all.size else np.nan,
+        "json_z_mean": safe_mean(xyz_all[:,2]) if xyz_all.size else np.nan,
+        "json_x_std":  safe_std(xyz_all[:,0]) if xyz_all.size else np.nan,
+        "json_y_std":  safe_std(xyz_all[:,1]) if xyz_all.size else np.nan,
+        "json_z_std":  safe_std(xyz_all[:,2]) if xyz_all.size else np.nan,
+    }
+    return feats
+
+def build_json_feature_table(json_dir=JSON_DIR):
+    """
+    Percorre todos os .json da pasta e monta um DataFrame:
+      file_stem | <features...>
+    onde file_stem é o nome-base do arquivo (sem .json). 
+    Depois a gente junta com o df do CSV pelo 'file_name' compatível.
+    """
+    rows = []
+    for jp in glob(os.path.join(json_dir, "*" + JSON_SUFFIX)):
+        stem = os.path.splitext(os.path.basename(jp))[0]
+        feats = extract_features_from_json(jp)
+        feats["file_stem"] = stem
+        rows.append(feats)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+json_feats = pd.DataFrame()
+if USE_JSON_FEATURES and os.path.isdir(JSON_DIR):
+    print(f"[JSON] Extraindo features de: {JSON_DIR}/")
+    json_feats = build_json_feature_table(JSON_DIR)
+    print(f"[JSON] Vetores gerados: {json_feats.shape}")
+else:
+    print("[JSON] Pasta não encontrada ou USE_JSON_FEATURES=False — pulando features de JSON.")
+
+# CSV tem 'file_name' (ex.: "Adicao_AP.mp4"). Meus JSONs têm nomes tipo "Adicao_AP_1.json".
+# Para casar, eu tiro a extensão do file_name e checo se o 'file_stem' do JSON começa com esse prefixo.
+# Se existir mais de um JSON para o mesmo vídeo (_1, _2, ...), eu agrego por média (simples e estável).
+def strip_ext(name):
+    return os.path.splitext(str(name))[0]
+
+if not json_feats.empty and "file_name" in df.columns:
+    df["_file_stem_csv"] = df["file_name"].apply(strip_ext).str.lower()
+    json_feats["_file_stem_json"] = json_feats["file_stem"].str.lower()
+
+    mapping = []
+    for stem_csv in df["_file_stem_csv"].unique():
+        subset = json_feats[ json_feats["_file_stem_json"].str.startswith(stem_csv, na=False) ]
+        if subset.empty:
+            # Nnenhum JSON encontrado pra esse vídeo
+            agg = pd.DataFrame([{ "file_stem_csv": stem_csv, **{c: np.nan for c in subset.columns if c not in ["file_stem","_file_stem_json"]} }])
+        else:
+            # Agrego por média (poderia usar max, mediana, etc.)
+            agg_vals = subset.drop(columns=["file_stem","_file_stem_json"]).mean(numeric_only=True).to_dict()
+            agg = pd.DataFrame([{ "file_stem_csv": stem_csv, **agg_vals }])
+        mapping.append(agg)
+    map_df = pd.concat(mapping, ignore_index=True)
+
+    # Juntar no df principal
+    df = df.merge(map_df, left_on="_file_stem_csv", right_on="file_stem_csv", how="left")
+    df.drop(columns=["_file_stem_csv", "file_stem_csv"], inplace=True, errors="ignore")
+    print("[JSON] Merge concluído. Novas colunas (amostra):", [c for c in df.columns if c.startswith("json_")][:10])
+else:
+    print("[JSON] Não foi possível associar JSONs (faltou 'file_name' no CSV ou tabela JSON vazia).")
+
+
 # 1a) Pré-processamento dos dados
 # Separo rótulo (y) e atributos (X)
 # Trato ausentes + padronizo numéricos
